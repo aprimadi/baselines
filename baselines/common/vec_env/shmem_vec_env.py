@@ -2,12 +2,11 @@
 An interface for asynchronous vectorized environments.
 """
 
-from multiprocessing import Pipe, Array, Process
+import multiprocessing as mp
 import numpy as np
-from . import VecEnv, CloudpickleWrapper
+from .vec_env import VecEnv, CloudpickleWrapper, clear_mpi_env_vars
 import ctypes
 from baselines import logger
-from baselines.common.tile_images import tile_images
 
 from .util import dict_to_obs, obs_space_info, obs_to_dict
 
@@ -20,15 +19,15 @@ _NP_TO_CT = {np.float32: ctypes.c_float,
 
 class ShmemVecEnv(VecEnv):
     """
-    An AsyncEnv that uses multiprocessing to run multiple
-    environments in parallel.
+    Optimized version of SubprocVecEnv that uses shared variables to communicate observations.
     """
 
-    def __init__(self, env_fns, spaces=None):
+    def __init__(self, env_fns, spaces=None, context='spawn'):
         """
         If you don't specify observation_space, we'll have to create a dummy
         environment to get it.
         """
+        ctx = mp.get_context(context)
         if spaces:
             observation_space, action_space = spaces
         else:
@@ -41,20 +40,21 @@ class ShmemVecEnv(VecEnv):
         VecEnv.__init__(self, len(env_fns), observation_space, action_space)
         self.obs_keys, self.obs_shapes, self.obs_dtypes = obs_space_info(observation_space)
         self.obs_bufs = [
-            {k: Array(_NP_TO_CT[self.obs_dtypes[k].type], int(np.prod(self.obs_shapes[k]))) for k in self.obs_keys}
+            {k: ctx.Array(_NP_TO_CT[self.obs_dtypes[k].type], int(np.prod(self.obs_shapes[k]))) for k in self.obs_keys}
             for _ in env_fns]
         self.parent_pipes = []
         self.procs = []
-        for env_fn, obs_buf in zip(env_fns, self.obs_bufs):
-            wrapped_fn = CloudpickleWrapper(env_fn)
-            parent_pipe, child_pipe = Pipe()
-            proc = Process(target=_subproc_worker,
-                           args=(child_pipe, parent_pipe, wrapped_fn, obs_buf, self.obs_shapes, self.obs_dtypes, self.obs_keys))
-            proc.daemon = True
-            self.procs.append(proc)
-            self.parent_pipes.append(parent_pipe)
-            proc.start()
-            child_pipe.close()
+        with clear_mpi_env_vars():
+            for env_fn, obs_buf in zip(env_fns, self.obs_bufs):
+                wrapped_fn = CloudpickleWrapper(env_fn)
+                parent_pipe, child_pipe = ctx.Pipe()
+                proc = ctx.Process(target=_subproc_worker,
+                            args=(child_pipe, parent_pipe, wrapped_fn, obs_buf, self.obs_shapes, self.obs_dtypes, self.obs_keys))
+                proc.daemon = True
+                self.procs.append(proc)
+                self.parent_pipes.append(parent_pipe)
+                proc.start()
+                child_pipe.close()
         self.waiting_step = False
         self.viewer = None
 
@@ -76,7 +76,7 @@ class ShmemVecEnv(VecEnv):
         obs, rews, dones, infos = zip(*outs)
         return self._decode_obses(obs), np.array(rews), np.array(dones), infos
 
-    def close(self):
+    def close_extras(self):
         if self.waiting_step:
             self.step_wait()
         for pipe in self.parent_pipes:
@@ -86,24 +86,11 @@ class ShmemVecEnv(VecEnv):
             pipe.close()
         for proc in self.procs:
             proc.join()
-        if self.viewer is not None:
-            self.viewer.close()
 
-    def render(self, mode='human'):
+    def get_images(self, mode='human'):
         for pipe in self.parent_pipes:
             pipe.send(('render', None))
-        imgs = [pipe.recv() for pipe in self.parent_pipes]
-        bigimg = tile_images(imgs)
-        if mode == 'human':
-            if self.viewer is None:
-                from gym.envs.classic_control import rendering
-                self.viewer = rendering.SimpleImageViewer()
-
-            self.viewer.imshow(bigimg[:, :, ::-1])
-        elif mode == 'rgb_array':
-            return bigimg
-        else:
-            raise NotImplementedError
+        return [pipe.recv() for pipe in self.parent_pipes]
 
     def _decode_obses(self, obs):
         result = {}
